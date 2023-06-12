@@ -475,7 +475,9 @@ void Banner(){
 }
 
 int main(int argc, char *argv[]){
-    
+
+// Arguments should only be parsed if Valkyrie is compiled as an executable.
+#ifndef DLL_BUILD
     if(argc != 1){
         for(int i = 1; i < argc; i++){
             switch(argv[i][0]){
@@ -507,6 +509,8 @@ int main(int argc, char *argv[]){
         Banner();
         return -1;
     }
+#endif
+
     printf("\n");
     printf("      \\\\                     //\n");
     printf("       \\\\                   //\n");
@@ -516,7 +520,7 @@ int main(int argc, char *argv[]){
 
     HMODULE BaseAddress = CustomGetModuleHandle(NULL);
 
-    if(ARG_SCAN){
+    if(ARG_SCAN && !ARG_AGGRESSIVE){
         printf("\n[+] Scanning imported functions for both inline and IAT hooks...\n\n");
         ScanImportedFunctions(BaseAddress);
         printf("[+] Finished scanning imported functions.\n\n");
@@ -531,3 +535,41 @@ int main(int argc, char *argv[]){
         printf("[+] Finished scanning every loaded module for inline hooks.\n");
     }
 }
+
+#ifdef DLL_BUILD
+BOOL WINAPI DllMain(HINSTANCE hinstDLL, DWORD fdwReason, LPVOID lpvReserved ){
+    switch( fdwReason ) 
+    { 
+        case DLL_PROCESS_ATTACH:
+            #ifdef scan
+            ARG_SCAN   = TRUE;
+            #endif
+            #ifdef unhook
+            ARG_SCAN   = TRUE;
+            ARG_UNHOOK = TRUE;
+            #endif
+            #ifdef aggressive
+            ARG_AGGRESSIVE = TRUE;
+            #endif
+            #ifdef verbose
+            ARG_VERBOSE = TRUE;
+            #endif
+            main(NULL, NULL);
+            break;
+
+        case DLL_THREAD_ATTACH:
+            break;
+
+        case DLL_THREAD_DETACH:
+            break;
+
+        case DLL_PROCESS_DETACH:
+            if (lpvReserved != NULL)
+            {
+                break;
+            }
+            break;
+    }
+    return TRUE;
+}
+#endif
