@@ -246,7 +246,9 @@ BOOL DetermineJump(BYTE *JumpSource){
             } else {
                 if(modRM != 0xff){
                     // 0xff is an invalid ModRM byte meaning it isn't actually a jump.
-                    printf("[!] PANIC: ModRM byte jumps are hard.\n");
+                    if(ARG_VERBOSE){
+                        printf("[!] PANIC: ModRM byte jumps are hard.\n");
+                    }
                 }
                 return FALSE;
             }
