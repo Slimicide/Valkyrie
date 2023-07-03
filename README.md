@@ -9,6 +9,8 @@ A Windows function hook detection / unhooking tool written in C.
 # Inline Hook Detection & Unhooking
 ![](images/Inline_Unhooking.png)
 
+Valkyrie now leverages Indirect Syscalls to NtProtectVirtualMemory to change memory page permissions to facilitate unhooking.
+
 # Compilation as a DLL
 Valkyrie's EXE is useful for recon. It will discover and report blatant hooks, but hooks are implemented on a process level.
 
@@ -16,13 +18,15 @@ Unhooking hooked functions using Valkyrie.exe will likely unhook them, but it wi
 
 As a DLL, Valkyrie can be deployed to unhook functions for other executables Valkyrie.dll is loaded into.
 
-Turning Valkyrie.dll into a reflective DLL for easy, clean execution is ideal, traditional DLL injection would also work.
+Turning Valkyrie.dll into a reflective DLL for easy, clean execution is ideal, traditional DLL injection also works.
 
 Tested using the [sRDI](https://github.com/monoxgas/sRDI) project to simplify the conversion into reflective shellcode.
 
 Using sRDI, simply add Valkyrie's reflective shellcode to another tool's source, upon execution, Valkyrie will begin the hunt.
 
 # Building
+Install [NASM](https://www.nasm.us/) and include `nasm.exe` in PATH.
+
 Using the x64 Native Tools Command Prompt from Visual Studio:
 
 ### EXE
@@ -54,9 +58,7 @@ buildDLL.bat scan unhook aggressive
 ```
 
 # Current Shortcomings
-Valkyrie relies on VirtualProtect to perform inline unhooking by temporarily modifying module memory page permissions.
-
-If VirtualProtect is hooked, well, you see the problem.
+Tested exclusively on x64 Windows 10.
 
 ***Note: Valkyrie is a hobby project, it has been exclusively tested against simple MS-Detours hooks in benign binaries.
 I would like to imagine security products wouldn't be interfered with as easily, test it out with that in mind.***
@@ -64,5 +66,7 @@ I would like to imagine security products wouldn't be interfered with as easily,
 # References
 * [Sektor7](https://institute.sektor7.net/)
 * [AMD64 Architecture Programmer’s Manual](https://www.amd.com/system/files/TechDocs/40332.pdf)
+* [Outflank Direct Syscalls Blog](https://outflank.nl/blog/2019/06/19/red-team-tactics-combining-direct-system-calls-and-srdi-to-bypass-av-edr/)
 * [Vergilius Project](https://www.vergiliusproject.com/kernels/x64/Windows%2011/22H2%20(2022%20Update))
+* [j00ru's Syscall Table](https://j00ru.vexillium.org/syscalls/nt/64/)
 * [ChatGPT](https://openai.com/blog/chatgpt)
