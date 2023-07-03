@@ -1,10 +1,11 @@
 #include <stdio.h>
 #include <Windows.h>
 #include <winternl.h>
+#include <detours.h>
+
+// Only works on x64 Win 10.
 
 // TODO:
-// Do better testing on IAT hooks, ensure you can actually hook the IAT, not just simulate it.
-// Need a stealthy means of calling VirtualProtect AND need to ensure VirtualProtect is NOT hooked.
 // Find out what the 0xc00 is.
 
 // REFERENCES
@@ -12,11 +13,74 @@
 // Sektor7
 // https://www.amd.com/system/files/TechDocs/40332.pdf
 // https://www.vergiliusproject.com/kernels/x64/Windows%2011/22H2%20(2022%20Update)
+// https://outflank.nl/blog/2019/06/19/red-team-tactics-combining-direct-system-calls-and-srdi-to-bypass-av-edr/
+// https://j00ru.vexillium.org/syscalls/nt/64/
+
+// Sys_NtProtectVirtualMemory is implemented in Syscall.asm
+extern NTSTATUS Sys_NtProtectVirtualMemory(HANDLE  ProcessHandle,
+                                           PVOID   *BaseAddress,
+                                           PSIZE_T NumberOfBytesToProtect,
+                                           ULONG   NewAccessProtection,
+                                           PULONG  OldAccessProtection,
+                                           LPVOID  SysCallAddress);
 
 BOOL ARG_SCAN       = FALSE;
 BOOL ARG_UNHOOK     = FALSE;
 BOOL ARG_VERBOSE    = FALSE;
 BOOL ARG_AGGRESSIVE = FALSE;
+
+FARPROC CustomGetProcAddress(HMODULE BaseAddress, char *ProcName){
+    IMAGE_DOS_HEADER *DosHeader = (IMAGE_DOS_HEADER *)BaseAddress;
+    IMAGE_NT_HEADERS *NtHeader  = (IMAGE_NT_HEADERS *)(DosHeader->e_lfanew + (BYTE *)BaseAddress);
+    IMAGE_EXPORT_DIRECTORY *ExportDirectory = (IMAGE_EXPORT_DIRECTORY *)(NtHeader->OptionalHeader.DataDirectory[IMAGE_DIRECTORY_ENTRY_EXPORT].VirtualAddress + (BYTE *)BaseAddress);
+
+    DWORD *EAT             = (DWORD *)(ExportDirectory->AddressOfFunctions    + (BYTE *)BaseAddress);
+    DWORD *FunctionName    = (DWORD *)(ExportDirectory->AddressOfNames        + (BYTE *)BaseAddress);
+    WORD  *FunctionOrdinal = (WORD  *)(ExportDirectory->AddressOfNameOrdinals + (BYTE *)BaseAddress);
+
+    for(int i = 0; i < ExportDirectory->NumberOfNames; i++){
+        char *CurrentFunctionName = (char *)(FunctionName[i] + (BYTE *)BaseAddress);
+        if(strcmp(CurrentFunctionName, ProcName) == 0){
+            void *FunctionAddress = (void *)(EAT[FunctionOrdinal[i]] + (BYTE *)BaseAddress);
+            return (FARPROC)FunctionAddress;
+        }
+    }
+    return NULL;
+}
+
+HMODULE CustomGetModuleHandle(char *ModuleName){
+    PEB *ProcessEnvironmentBlock = (PEB *)__readgsqword(0x60);
+    PEB_LDR_DATA *Loader = (PEB_LDR_DATA *)ProcessEnvironmentBlock->Ldr;
+    LIST_ENTRY *ModuleList = &Loader->InMemoryOrderModuleList;
+    LIST_ENTRY *CurrentEntry = ModuleList->Flink;
+
+    if(ModuleName == NULL){
+        LDR_DATA_TABLE_ENTRY *DataCurrentListEntry = (LDR_DATA_TABLE_ENTRY *)((BYTE *)CurrentEntry - sizeof(LIST_ENTRY));
+        return (HMODULE)DataCurrentListEntry->DllBase;
+    } else {
+
+        WCHAR WideModuleName[256];
+        size_t len = mbstowcs(WideModuleName, ModuleName, sizeof(WideModuleName) / sizeof(WCHAR));
+
+        while(CurrentEntry != ModuleList){
+            LDR_DATA_TABLE_ENTRY *DataCurrentListEntry = (LDR_DATA_TABLE_ENTRY *)((BYTE *)CurrentEntry - sizeof(LIST_ENTRY));
+            UNICODE_STRING *BaseDllName = (UNICODE_STRING *)DataCurrentListEntry->Reserved4;
+
+            size_t DllNameLen = wcslen(BaseDllName->Buffer);
+            WCHAR *cmpDllName = malloc(DllNameLen * sizeof(WCHAR));
+            wcscpy_s(cmpDllName, DllNameLen * sizeof(WORD), BaseDllName->Buffer);
+
+            if(wcscmp(_wcslwr(cmpDllName), _wcslwr(WideModuleName)) == 0){
+                return (HMODULE)DataCurrentListEntry->DllBase; 
+            }
+            CurrentEntry = CurrentEntry->Flink;
+            
+            free(cmpDllName);
+            cmpDllName = NULL;
+        }
+        return NULL;
+    }
+}
 
 void ScanModuleFunctions(HMODULE BaseAddress){
     static BOOL init = TRUE;
@@ -28,9 +92,9 @@ void ScanModuleFunctions(HMODULE BaseAddress){
         init = FALSE;
     }
 
-    IMAGE_DOS_HEADER *dosHeader = (IMAGE_DOS_HEADER *)BaseAddress;
-    IMAGE_NT_HEADERS *ntHeader  = (IMAGE_NT_HEADERS *)(dosHeader->e_lfanew + (BYTE *)BaseAddress);
-    IMAGE_EXPORT_DIRECTORY *ExportDirectory = (IMAGE_EXPORT_DIRECTORY *)(ntHeader->OptionalHeader.DataDirectory[IMAGE_DIRECTORY_ENTRY_EXPORT].VirtualAddress + (BYTE *)BaseAddress);
+    IMAGE_DOS_HEADER *DosHeader = (IMAGE_DOS_HEADER *)BaseAddress;
+    IMAGE_NT_HEADERS *NtHeader  = (IMAGE_NT_HEADERS *)(DosHeader->e_lfanew + (BYTE *)BaseAddress);
+    IMAGE_EXPORT_DIRECTORY *ExportDirectory = (IMAGE_EXPORT_DIRECTORY *)(NtHeader->OptionalHeader.DataDirectory[IMAGE_DIRECTORY_ENTRY_EXPORT].VirtualAddress + (BYTE *)BaseAddress);
     char *ModuleName = ExportDirectory->Name + (BYTE *)BaseAddress;
 
     if(ScannedModules){
@@ -83,8 +147,13 @@ void ScanModuleFunctions(HMODULE BaseAddress){
 }
 
 BOOL UnhookInline(void *UnhookAddress, LDR_DATA_TABLE_ENTRY *Module){
+    LPVOID SysAddr_NtProtectVirtualMemory = NULL;
+    PVOID Address = UnhookAddress;
+    SIZE_T NumberOfBytesToProtect = 0x1000;
+    ULONG NewAccessProtection = PAGE_READWRITE;
+    ULONG OldAccessProtection = 0;
+
     FILE *CleanModule = NULL;
-    DWORD OldProtect = 0;
     DWORD UnhookIncrement = 0;
     DWORD Offset = (BYTE *)UnhookAddress - (BYTE *)Module->DllBase - 0xc00; // Why minus 0xc00? Who knows, but it works!
 
@@ -97,21 +166,25 @@ BOOL UnhookInline(void *UnhookAddress, LDR_DATA_TABLE_ENTRY *Module){
         wprintf(L"[!] Unhooking: Failed to jump to function offset in %ls.\n", Module->FullDllName.Buffer);
     }
 
-    unsigned char cleanBuffer[8];
-    fread(cleanBuffer, sizeof(cleanBuffer), 1, CleanModule);
+    unsigned char CleanBuffer[8];
+    fread(CleanBuffer, sizeof(CleanBuffer), 1, CleanModule);
 
-    if(VirtualProtect(UnhookAddress, 4096, PAGE_EXECUTE_READWRITE, &OldProtect)){
-        while(*(LONGLONG *)UnhookAddress != *(LONGLONG *)cleanBuffer){
-            for(int i = 0; i < sizeof(cleanBuffer); i++){
-                *(BYTE *)UnhookAddress = cleanBuffer[i];
+    SysAddr_NtProtectVirtualMemory = CustomGetProcAddress(CustomGetModuleHandle("ntdll.dll"), "NtProtectVirtualMemory");
+    SysAddr_NtProtectVirtualMemory = (BYTE *)SysAddr_NtProtectVirtualMemory + 0x12; //Syscall is 0x12 bytes after start of function.
+
+    NTSTATUS Status = Sys_NtProtectVirtualMemory((HANDLE)-1, &Address, &NumberOfBytesToProtect, PAGE_READWRITE, &OldAccessProtection, SysAddr_NtProtectVirtualMemory);
+    if(NT_SUCCESS(Status)){
+        while(*(LONGLONG *)UnhookAddress != *(LONGLONG *)CleanBuffer){
+            for(int i = 0; i < sizeof(CleanBuffer); i++){
+                *(BYTE *)UnhookAddress = CleanBuffer[i];
                 (BYTE *)UnhookAddress += 1;
                 UnhookIncrement += 1;
             }
-            fread(cleanBuffer, sizeof(cleanBuffer), 1, CleanModule);   
+            fread(CleanBuffer, sizeof(CleanBuffer), 1, CleanModule);   
         }
         fclose(CleanModule);
         (BYTE *)UnhookAddress -= UnhookIncrement;
-        VirtualProtect(UnhookAddress, 4096, OldProtect, &OldProtect);
+        Status = Sys_NtProtectVirtualMemory((HANDLE)-1, &Address, &NumberOfBytesToProtect, OldAccessProtection, &OldAccessProtection, SysAddr_NtProtectVirtualMemory);
         return TRUE;
     } else {
         wprintf(L"[!] Unhooking: Failed to modify %ls page permissions.\n", Module->FullDllName.Buffer);
@@ -119,44 +192,10 @@ BOOL UnhookInline(void *UnhookAddress, LDR_DATA_TABLE_ENTRY *Module){
     }
 }
 
-HMODULE CustomGetModuleHandle(char *ModuleName){
-    PEB *ProcessEnvironmentBlock = (PEB *)__readgsqword(0x60);
-    PEB_LDR_DATA *Loader = (PEB_LDR_DATA *)ProcessEnvironmentBlock->Ldr;
-    LIST_ENTRY *ModuleList = &Loader->InMemoryOrderModuleList;
-    LIST_ENTRY *CurrentEntry = ModuleList->Flink;
-
-    if(ModuleName == NULL){
-        LDR_DATA_TABLE_ENTRY *DataCurrentListEntry = (LDR_DATA_TABLE_ENTRY *)((BYTE *)CurrentEntry - sizeof(LIST_ENTRY));
-        return (HMODULE)DataCurrentListEntry->DllBase;
-    } else {
-
-        WCHAR WideModuleName[256];
-        size_t len = mbstowcs(WideModuleName, ModuleName, sizeof(WideModuleName) / sizeof(WCHAR));
-
-        while(CurrentEntry != ModuleList){
-            LDR_DATA_TABLE_ENTRY *DataCurrentListEntry = (LDR_DATA_TABLE_ENTRY *)((BYTE *)CurrentEntry - sizeof(LIST_ENTRY));
-            UNICODE_STRING *BaseDllName = (UNICODE_STRING *)DataCurrentListEntry->Reserved4;
-
-            size_t DllNameLen = wcslen(BaseDllName->Buffer);
-            WCHAR *cmpDllName = malloc(DllNameLen * sizeof(WCHAR));
-            wcscpy_s(cmpDllName, DllNameLen * sizeof(WORD), BaseDllName->Buffer);
-
-            if(wcscmp(_wcslwr(cmpDllName), _wcslwr(WideModuleName)) == 0){
-                return (HMODULE)DataCurrentListEntry->DllBase; 
-            }
-            CurrentEntry = CurrentEntry->Flink;
-            
-            free(cmpDllName);
-            cmpDllName = NULL;
-        }
-        return NULL;
-    }
-}
-
 char *GetFunctionName(HMODULE BaseAddress, void *ProcAddress){
-    IMAGE_DOS_HEADER *dosHeader = (IMAGE_DOS_HEADER *)BaseAddress;
-    IMAGE_NT_HEADERS *ntHeader  = (IMAGE_NT_HEADERS *)(dosHeader->e_lfanew + (BYTE *)BaseAddress);
-    IMAGE_EXPORT_DIRECTORY *ExportDirectory = (IMAGE_EXPORT_DIRECTORY *)(ntHeader->OptionalHeader.DataDirectory[IMAGE_DIRECTORY_ENTRY_EXPORT].VirtualAddress + (BYTE *)BaseAddress);
+    IMAGE_DOS_HEADER *DosHeader = (IMAGE_DOS_HEADER *)BaseAddress;
+    IMAGE_NT_HEADERS *NtHeader  = (IMAGE_NT_HEADERS *)(DosHeader->e_lfanew + (BYTE *)BaseAddress);
+    IMAGE_EXPORT_DIRECTORY *ExportDirectory = (IMAGE_EXPORT_DIRECTORY *)(NtHeader->OptionalHeader.DataDirectory[IMAGE_DIRECTORY_ENTRY_EXPORT].VirtualAddress + (BYTE *)BaseAddress);
 
     DWORD *EAT             = (DWORD *)(ExportDirectory->AddressOfFunctions    + (BYTE *)BaseAddress);
     DWORD *FunctionName    = (DWORD *)(ExportDirectory->AddressOfNames        + (BYTE *)BaseAddress);
@@ -241,7 +280,7 @@ BOOL DetermineJump(BYTE *JumpSource){
             unsigned char mod   = (modRM >> 6) & 0b00000011; // Bit 7, 6
             unsigned char reg   = (modRM >> 3) & 0b00000111; // Bit 5, 4, 3
             unsigned char rm    =  modRM       & 0b00000111; // Bit 2, 1, 0
-            if(mod == 0b00000000 && rm == 0b00000101){ // 0xFF25 is *very* common if not exclusively present
+            if(mod == 0b00000000 && rm == 0b00000101){       // 0xFF25 is *very* common if not exclusively present
                 ByteAmount = 5; // 0xff *XX YY YY YY YY* (XX == ModRM byte, YY == signed 32-bit displacement)
             } else {
                 if(modRM != 0xff){
@@ -414,9 +453,9 @@ void ScanImportedFunctions(HMODULE BaseAddress){
     BOOL IATHooked    = FALSE;
     BOOL InlineHooked = FALSE;
 
-    IMAGE_DOS_HEADER *dosHeader = (IMAGE_DOS_HEADER *)BaseAddress;
-    IMAGE_NT_HEADERS *ntHeader  = (IMAGE_NT_HEADERS *)(dosHeader->e_lfanew + (BYTE *)BaseAddress);
-    IMAGE_IMPORT_DESCRIPTOR *ImportDirectory = (IMAGE_IMPORT_DESCRIPTOR *)(ntHeader->OptionalHeader.DataDirectory[IMAGE_DIRECTORY_ENTRY_IMPORT].VirtualAddress + (BYTE *)BaseAddress);
+    IMAGE_DOS_HEADER *DosHeader = (IMAGE_DOS_HEADER *)BaseAddress;
+    IMAGE_NT_HEADERS *NtHeader  = (IMAGE_NT_HEADERS *)(DosHeader->e_lfanew + (BYTE *)BaseAddress);
+    IMAGE_IMPORT_DESCRIPTOR *ImportDirectory = (IMAGE_IMPORT_DESCRIPTOR *)(NtHeader->OptionalHeader.DataDirectory[IMAGE_DIRECTORY_ENTRY_IMPORT].VirtualAddress + (BYTE *)BaseAddress);
 
     while(ImportDirectory->Name != 0){
         IMAGE_THUNK_DATA *ILT = (IMAGE_THUNK_DATA *)(ImportDirectory->OriginalFirstThunk + (BYTE *)BaseAddress);
@@ -477,7 +516,6 @@ void Banner(){
 }
 
 int main(int argc, char *argv[]){
-
 // Arguments should only be parsed if Valkyrie is compiled as an executable.
 #ifndef DLL_BUILD
     if(argc != 1){
@@ -525,7 +563,7 @@ int main(int argc, char *argv[]){
     if(ARG_SCAN && !ARG_AGGRESSIVE){
         printf("\n[+] Scanning imported functions for both inline and IAT hooks...\n\n");
         ScanImportedFunctions(BaseAddress);
-        printf("[+] Finished scanning imported functions.\n\n");
+        printf("[+] Finished scanning imported functions.\n");
     }
 
     if(ARG_AGGRESSIVE){
