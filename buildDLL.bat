@@ -8,5 +8,7 @@ set "COMPILER_ARGUMENTS="
 for %%A in (%ARGUMENTS%) do (
 	set "COMPILER_ARGUMENTS=!COMPILER_ARGUMENTS! /D %%A"
 )
-cl.exe /nologo /wd 4024 /wd 4047 /LD /D DLL_BUILD %COMPILER_ARGUMENTS% src\Valkyrie.c user32.lib
+nasm.exe -fwin64 -o Syscall.obj src\Syscall.asm
+cl.exe /nologo /wd 4024 /wd 4047 /LD /D DLL_BUILD %COMPILER_ARGUMENTS% src\Valkyrie.c Syscall.obj user32.lib
+del Syscall.obj
 del Valkyrie.obj
